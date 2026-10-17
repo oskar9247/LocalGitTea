@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # --- DATENBANK FÜR GITEA ---
+  gitea-db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=CHANGE_ME # <--- BITTE ÄNDERN!
+      - POSTGRES_DB=gitea
+    volumes:
+      - gitea-db-data:/var/lib/postgresql/data
+    networks:
+      - gitea-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager # Hält die DB auf dem Manager für einfachere Volume-Zuordnung
+
+  # --- GITEA (GIT SERVICE) ---
+  gitea:
+    image: gitea/gitea:1.22 # <--- Oder 'latest' nutzen
+    environment:
+      - APP_NAME=Mein Gitea Service
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=gitea-db:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=CHANGE_ME # <--- Muss mit POSTGRES_PASSWORD übereinstimmen!
+    volumes:
+      - gitea-data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3000:3000" # Web-Oberfläche
+      - "2222:22"   # SSH für Git-Anfragen
+    networks:
+      - gitea-net
+    depends_on:
+      - gitea-db
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  # --- DOCKER REGISTRY (IMAGE MANAGEMENT) ---
+  registry:
+    image: registry:2
+    environment:
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry
+    volumes:
+      - registry-data:/var/lib/registry
+    ports:
+      - "5000:5000"
+    networks:
+      - gitea-net
+    deploy:
+      replicas: 1
+
+  # --- OBERFLÄCHE FÜR DIE DOCKER REGISTRY ---
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    environment:
+      - REGISTRY_TITLE=Mein Image Server
+      - REGISTRY_URL=http://registry:5000
+      - SINGLE_REGISTRY=true
+    ports:
+      - "9081:80" # Web-UI für Docker Images
+    networks:
+      - gitea-net
+    depends_on:
+      - registry
+    deploy:
+      replicas: 1
+
+volumes:
+  gitea-data:
+  gitea-db-data:
+  registry-data:
+
+networks:
+  gitea-net:
+    driver: overlay # Wichtig für Docker Swarm Multi-Host-Networking
