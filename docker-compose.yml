@@ -1,85 +1,157 @@
 version: '3.8'
 
 services:
-  # --- DATENBANK FÜR GITEA ---
-  gitea-db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=gitea
-      - POSTGRES_PASSWORD=CHANGE_ME # <--- BITTE ÄNDERN!
-      - POSTGRES_DB=gitea
+  traefik:
+    image: traefik:v3.6
+    command:
+      - "--providers.swarm=true"
+      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
+      - "--providers.swarm.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Globaler HTTP-zu-HTTPS Redirect
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
-      - gitea-db-data:/var/lib/postgresql/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - gitea-net
+      - gitea_isolated_network
     deploy:
       placement:
         constraints:
-          - node.role == manager # Hält die DB auf dem Manager für einfachere Volume-Zuordnung
+          - node.role == manager
 
-  # --- GITEA (GIT SERVICE) ---
   gitea:
-    image: gitea/gitea:1.22 # <--- Oder 'latest' nutzen
+    image: gitea/gitea:latest
     environment:
-      - APP_NAME=Mein Gitea Service
       - USER_UID=1000
       - USER_GID=1000
       - GITEA__database__DB_TYPE=postgres
-      - GITEA__database__HOST=gitea-db:5432
+      - GITEA__database__HOST=db:5432
       - GITEA__database__NAME=gitea
       - GITEA__database__USER=gitea
-      - GITEA__database__PASSWD=CHANGE_ME # <--- Muss mit POSTGRES_PASSWORD übereinstimmen!
+      - GITEA__database__PASSWD=gitea_secure_password
+      - GITEA__actions__ENABLED=true
     volumes:
-      - gitea-data:/data
+      - gitea_data:/data
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     ports:
-      - "3000:3000" # Web-Oberfläche
-      - "2222:22"   # SSH für Git-Anfragen
+      - "2222:22"
     networks:
-      - gitea-net
-    depends_on:
-      - gitea-db
+      - gitea_isolated_network
     deploy:
+      mode: replicated
       replicas: 1
-      restart_policy:
-        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=gitea-stack_gitea_isolated_network"
+        - "traefik.http.routers.gitea.rule=Host(`gitea.localhost`)"
+        - "traefik.http.routers.gitea.entrypoints=websecure"
+        - "traefik.http.routers.gitea.tls=true"
+        # Korrekter interner Service-Name für Traefik v3 Swarm
+        - "traefik.http.services.gitea-stack-gitea.loadbalancer.server.port=3000"
 
-  # --- DOCKER REGISTRY (IMAGE MANAGEMENT) ---
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=gitea_secure_password
+      - POSTGRES_DB=gitea
+    volumes:
+      - gitea_db:/var/lib/postgresql/data
+    networks:
+      - gitea_isolated_network
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
   registry:
     image: registry:2
     environment:
       - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry
+      - REGISTRY_HTTP_CORS_ALLOWEDORIGINS=["*"]
+      - REGISTRY_HTTP_CORS_ALLOWEDMETHODS=["HEAD","GET","OPTIONS","POST","PUT","DELETE"]
+      - REGISTRY_HTTP_CORS_ALLOWEDHEADERS=["Authorization","Accept","Cache-Control","Content-Type"]
     volumes:
-      - registry-data:/var/lib/registry
-    ports:
-      - "5000:5000"
+      - registry_data:/var/lib/registry
     networks:
-      - gitea-net
+      - gitea_isolated_network
     deploy:
+      mode: replicated
       replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=gitea-stack_gitea_isolated_network"
+        - "traefik.http.routers.registry.rule=Host(`registry.localhost`)"
+        - "traefik.http.routers.registry.entrypoints=websecure"
+        - "traefik.http.routers.registry.tls=true"
+        # Korrekter interner Service-Name für Traefik v3 Swarm
+        - "traefik.http.services.gitea-stack-registry.loadbalancer.server.port=5000"
 
-  # --- OBERFLÄCHE FÜR DIE DOCKER REGISTRY ---
   registry-ui:
     image: joxit/docker-registry-ui:latest
     environment:
-      - REGISTRY_TITLE=Mein Image Server
-      - REGISTRY_URL=http://registry:5000
+      - REGISTRY_TITLE=Meine Docker Registry
+      - NGINX_PROXY_PASS_URL=http://registry:5000
       - SINGLE_REGISTRY=true
-    ports:
-      - "9081:80" # Web-UI für Docker Images
     networks:
-      - gitea-net
-    depends_on:
-      - registry
+      - gitea_isolated_network
     deploy:
+      mode: replicated
       replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=gitea-stack_gitea_isolated_network"
+        - "traefik.http.routers.registry-ui.rule=Host(`registry-ui.localhost`)"
+        - "traefik.http.routers.registry-ui.entrypoints=websecure"
+        - "traefik.http.routers.registry-ui.tls=true"
+        # Korrekter interner Service-Name für Traefik v3 Swarm
+        - "traefik.http.services.gitea-stack-registry-ui.loadbalancer.server.port=80"
+
+  gitea-runner:
+    image: gitea/act_runner:latest
+    environment:
+      - GITEA_INSTANCE_URL=http://gitea:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=DEIN_GEHEIMER_TOKEN_AUS_GITEA
+      - GITEA_RUNNER_NAME=swarm-runner
+      - GITEA_RUNNER_LABELS=ubuntu-latest:docker://node:16-bullseye,ubuntu-22.04:docker://node:16-bullseye
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - gitea_runner_data:/data
+    networks:
+      - gitea_isolated_network
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
 
 volumes:
-  gitea-data:
-  gitea-db-data:
-  registry-data:
+  gitea_data:
+  gitea_db:
+  registry_data:
+  gitea_runner_data:
 
 networks:
-  gitea-net:
-    driver: overlay # Wichtig für Docker Swarm Multi-Host-Networking
+  gitea_isolated_network:
+    driver: overlay
+    attachable: true
